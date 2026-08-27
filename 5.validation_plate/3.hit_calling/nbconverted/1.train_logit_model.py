@@ -18,10 +18,12 @@ import pathlib
 import random
 import sys
 
-from joblib import Parallel, delayed
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import polars as pl
+import seaborn as sns
+from joblib import Parallel, delayed
 
 sys.path.append("../../3a.train_dmso_logistic_regression_models/src")
 from cfret_ml.data_split_utils import (
@@ -113,60 +115,74 @@ plate_repr = plate_file.stem
 plate_output_dir = datasplit_dir / plate_repr
 plate_output_dir.mkdir(exist_ok=True, parents=True)
 
-# Set the random seed for the plate based on its name to ensure reproducibility
-plate_name_salt = string_to_int_seed(plate_repr)
-salted_seed = salt_seed(random_state, plate_name_salt)
+# Skip regenerating datasplits if they already exist. The split is seeded off the
+# plate name (see salt_seed/string_to_int_seed below), so a rerun would produce
+# identical folds anyway -- this just avoids redoing the work and re-triggering
+# a full retrain downstream.
+existing_fold_files = sorted(plate_output_dir.glob("fold_*_split.json"))
+dmso_parquet_path = plate_output_dir / "DMSO.parquet"
+encoding_path = datasplit_dir / "cell_type_encoding.json"
 
-# Check to confirm two classes are present
-if DMSO_df["Metadata_cell_type"].nunique() < 2:
-    raise ValueError(f"Only one cell type present in {plate_repr}. Cannot perform stratified split.")
+if existing_fold_files and dmso_parquet_path.exists() and encoding_path.exists():
+    print(
+        f"Datasplits already exist for {plate_repr} "
+        f"({len(existing_fold_files)} folds found). Skipping split generation."
+    )
+else:
+    # Set the random seed for the plate based on its name to ensure reproducibility
+    plate_name_salt = string_to_int_seed(plate_repr)
+    salted_seed = salt_seed(random_state, plate_name_salt)
 
-# Perform stratified fold split (grouped by well, stratified by cell type)
-split = stratified_fold_split(
-    DMSO_df,
-    group_col="Metadata_Well",
-    class_col="Metadata_cell_type",
-    random_state=salted_seed,
-)
+    # Check to confirm two classes are present
+    if DMSO_df["Metadata_cell_type"].nunique() < 2:
+        raise ValueError(f"Only one cell type present in {plate_repr}. Cannot perform stratified split.")
 
-# Save the split information for each fold
-for i, (train_index, test_index) in enumerate(split):
-    fold_record = {
-        "fold": i,
-        "train_index": train_index.tolist(),
-        "test_index": test_index.tolist(),
-        "seed": salted_seed,
-    }
-    fold_record.update(
-        split_summary(
-            DMSO_df,
-            train_index,
-            test_index,
-            group_col="Metadata_Well",
-            label_col="Metadata_cell_type",
-        )
+    # Perform stratified fold split (grouped by well, stratified by cell type)
+    split = stratified_fold_split(
+        DMSO_df,
+        group_col="Metadata_Well",
+        class_col="Metadata_cell_type",
+        random_state=salted_seed,
     )
 
-    fold_documentation_path = plate_output_dir / f"fold_{i}_split.json"
-    with open(fold_documentation_path, "w") as f:
-        json.dump(fold_record, f, indent=4)
+    # Save the split information for each fold
+    for i, (train_index, test_index) in enumerate(split):
+        fold_record = {
+            "fold": i,
+            "train_index": train_index.tolist(),
+            "test_index": test_index.tolist(),
+            "seed": salted_seed,
+        }
+        fold_record.update(
+            split_summary(
+                DMSO_df,
+                train_index,
+                test_index,
+                group_col="Metadata_Well",
+                label_col="Metadata_cell_type",
+            )
+        )
 
-    held_out_wells = sorted(DMSO_df.loc[test_index, "Metadata_Well"].unique())
-    print(f"\tFold {i}: held out wells {held_out_wells}")
+        fold_documentation_path = plate_output_dir / f"fold_{i}_split.json"
+        with open(fold_documentation_path, "w") as f:
+            json.dump(fold_record, f, indent=4)
 
-print(f"Datasplits written for {plate_repr}.")
+        held_out_wells = sorted(DMSO_df.loc[test_index, "Metadata_Well"].unique())
+        print(f"\tFold {i}: held out wells {held_out_wells}")
 
-DMSO_df.to_parquet(plate_output_dir / "DMSO.parquet", index=False)
+    print(f"Datasplits written for {plate_repr}.")
 
-# Save cell type encoding for consistent model fitting and interpretation
-unique_cell_types = sorted(DMSO_df["Metadata_cell_type"].unique())
-cell_type_encoding = {ct: i for i, ct in enumerate(unique_cell_types)}
-print("Cell type encoding:")
-for ct, enc in cell_type_encoding.items():
-    print(f"\t{ct}: {enc}")
+    DMSO_df.to_parquet(dmso_parquet_path, index=False)
 
-with open(datasplit_dir / "cell_type_encoding.json", "w") as f:
-    json.dump(cell_type_encoding, f)
+    # Save cell type encoding for consistent model fitting and interpretation
+    unique_cell_types = sorted(DMSO_df["Metadata_cell_type"].unique())
+    cell_type_encoding = {ct: i for i, ct in enumerate(unique_cell_types)}
+    print("Cell type encoding:")
+    for ct, enc in cell_type_encoding.items():
+        print(f"\t{ct}: {enc}")
+
+    with open(encoding_path, "w") as f:
+        json.dump(cell_type_encoding, f)
 
 
 # ## Set variables for model training
@@ -186,7 +202,7 @@ eval_plot_dir.mkdir(exist_ok=True)
 
 # ## Train logit model
 
-# In[ ]:
+# In[7]:
 
 
 # Load cell type encoding used during data splitting
@@ -321,4 +337,80 @@ enriched_df = pd.merge(
     how="left",
 )
 enriched_df.to_csv(eval_plot_dir / "model_fit_summary.csv", index=False)
+
+
+# ## Visualize model performance across folds
+
+# In[9]:
+
+
+enriched_df['convergence_failed'] = (
+    enriched_df['average_precision'].isna() | enriched_df['roc_auc'].isna()
+)
+
+# Calculate convergence failure rate per fold, split by shuffle status so a
+# systematic failure of the "true" (non-shuffled) model is visible on its own
+failure_rates = (
+    enriched_df.groupby(['fold', 'shuffled'])['convergence_failed']
+    .mean()
+    .reset_index()
+)
+
+fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
+
+# With only one plate, each (fold, shuffled) pair has a single model fit --
+# not a distribution -- so barplots (one bar per pair) are used instead of
+# boxplots, which would otherwise render as invisible slivers for n=1 groups.
+# A missing bar means that model failed to converge (see convergence_failed
+# panel below), not a value of zero.
+
+# 1. Barplot for Average Precision
+sns.barplot(
+    data=enriched_df,
+    x='fold',
+    y='average_precision',
+    hue='shuffled',
+    ax=axes[0]
+)
+axes[0].set_title(f'Average Precision across Folds ({plate_repr})')
+axes[0].set_ylabel('Average Precision')
+axes[0].set_ylim(0, 1)
+axes[0].legend(title='Shuffled', loc='upper right')
+
+# 2. Barplot for ROC AUC
+sns.barplot(
+    data=enriched_df,
+    x='fold',
+    y='roc_auc',
+    hue='shuffled',
+    ax=axes[1]
+)
+axes[1].axhline(0.5, color='gray', linestyle='--', linewidth=1, label='Chance (0.5)')
+axes[1].set_title(f'ROC AUC across Folds ({plate_repr})')
+axes[1].set_ylabel('ROC AUC')
+axes[1].set_ylim(0, 1)
+axes[1].legend(title='Shuffled', loc='upper right')
+
+# 3. Barplot for failed convergence rate, split by shuffle status
+sns.barplot(
+    data=failure_rates,
+    x='fold',
+    y='convergence_failed',
+    hue='shuffled',
+    ax=axes[2]
+)
+axes[2].set_title(f'Rate of Failed Convergence across Folds ({plate_repr})')
+axes[2].set_ylabel('Failure Rate')
+axes[2].set_ylim(0, 1)
+axes[2].set_xlabel('Fold')
+axes[2].legend(title='Shuffled', loc='upper right')
+
+plt.tight_layout()
+plt.show()
+
+fig.savefig(
+    eval_plot_dir / "metric_convergence_summary.png",
+    dpi=300,
+    bbox_inches="tight"
+)
 
