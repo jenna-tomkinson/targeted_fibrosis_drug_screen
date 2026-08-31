@@ -4,6 +4,7 @@ Orchestrator module for the end to end process of data prep, cleaning, RFE,
     plate-split-shuffle.
 """
 
+import math
 import pathlib
 import json
 import joblib
@@ -13,6 +14,7 @@ from scipy.linalg import LinAlgError
 import pandas as pd
 
 from .preprocess import pre_fit_selection, screen_numeric_quasi_separation
+from .linear_sep import find_single_feature_separation_breakers
 from .regression_feature_selector import fit_rfe_l1_logit_selector
 from .regression_model import fit_statsmodels_logit
 from .eval import evaluate_model, save_curve_plot
@@ -28,7 +30,8 @@ def process_model_fitting(
     fold: int | str, 
     plate_fitted_model_dir: pathlib.Path, 
     plate_eval_plot_dir: pathlib.Path, 
-    random_state: int
+    random_state: int,
+    filter_linear_separation: bool = True,
 ):
     """
     The main Orchestrator function for end to end data prep, cleaning, RFE, 
@@ -37,6 +40,7 @@ def process_model_fitting(
     """
     # filter for low variance, covariance, and quasi-separation issues
     feat_filter_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_feat.tsv"
+    log_prefix = f"\tPlate {plate_repr} Fold {fold} {shuffle_status} >"
     if feat_filter_ckpt.exists():
         cols2keep = feat_filter_ckpt.read_text().splitlines()       
     else:
@@ -45,7 +49,7 @@ def process_model_fitting(
             high_corr_cols,
             cols2rm
         ) = pre_fit_selection(train_profiles)
-        print(f"\tPlate {plate_repr} Fold {fold} {shuffle_status} > Low var cols: {len(low_var_cols)}, High corr cols: {len(high_corr_cols)}")
+        print(f"{log_prefix} Low var cols: {len(low_var_cols)}, High corr cols: {len(high_corr_cols)}")
 
         report = screen_numeric_quasi_separation(
             X=train_profiles,
@@ -55,7 +59,7 @@ def process_model_fitting(
         )
         report.to_csv(plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_quasi_separation_report.csv", index=False)
         flagged_features = report.loc[report["flag"], "feature"].tolist()
-        print(f"\tPlate {plate_repr} Fold {fold} {shuffle_status} > Flagged {len(flagged_features)} features for quasi-separation.")
+        print(f"{log_prefix} Flagged {len(flagged_features)} features for quasi-separation.")
 
         cols2rm = set(cols2rm) | set(flagged_features)
         cols2keep = [col for col in train_profiles.columns if col not in cols2rm]
@@ -64,8 +68,8 @@ def process_model_fitting(
             f.write("\n".join(cols2keep))
 
     if not cols2keep:
-        print(f"\tNo features left after filtering in plate {plate_repr} fold {fold}, skipping model fitting.")
-        return None
+        print(f"{log_prefix} No features left after filtering, skipping model fitting.")
+        return None    
 
     train_profiles_filtered = train_profiles.loc[:, cols2keep]
 
@@ -91,10 +95,11 @@ def process_model_fitting(
             f.write("\n".join(selected_features))
 
     if len(selected_features) == 0:
-        print(f"\tNo features selected by RFE in plate {plate_repr} fold {fold}, skipping model fitting.")
-        return None
+        print(f"{log_prefix} No features selected by RFE, skipping model fitting.")
+        return None    
 
     train_profiles_rfe = train_profiles_filtered.loc[:, selected_features]
+
 
     # fit final statsmodels logit and save
     model_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_statsmodels_logit.joblib"
@@ -110,6 +115,23 @@ def process_model_fitting(
         train_profiles=train_profiles,
         selected_features=selected_features,
     )
+
+    if filter_linear_separation:
+        # stricter complete linear separation check to use in conjunction
+        # with quasi-separation filtering if enabled
+        breakers = find_single_feature_separation_breakers(
+            train_profiles_rfe,
+            labels,
+        )
+        if len(breakers) > math.ceil(len(selected_features) * 0.3):
+            print(
+                f"{log_prefix} Too many features "
+                f"are linearly-separable: {', '.join(breakers)}, skipping model fitting.")
+            return empty_result
+        else:
+            # permit the fit to proceed after dropping linearly separable features
+            print(f"{log_prefix} Dropping linearly separable features: {', '.join(breakers)}")
+            train_profiles_rfe = train_profiles_rfe.loc[:, [col for col in train_profiles_rfe.columns if col not in breakers]]
 
     if model_ckpt.exists():
         smt_result = joblib.load(model_ckpt)
