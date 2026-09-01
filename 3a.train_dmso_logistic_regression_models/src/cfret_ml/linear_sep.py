@@ -1,17 +1,16 @@
-"""
-Stricter, complete linear separation checks for features in a dataset against
-    categorical/binary response variable.
-"""
+"""Detect and repair complete separation in binary feature matrices."""
 
 from dataclasses import dataclass
+from typing import TypedDict
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from scipy.optimize import linprog
+from sklearn.feature_selection import RFE
 
 
-@dataclass
+@dataclass(frozen=True)
 class CompleteSeparationResult:
     separable: bool
     status: int
@@ -19,40 +18,93 @@ class CompleteSeparationResult:
     coefficients: pd.Series | None = None
 
 
+class SeparationRepairResult(TypedDict):
+    selected_features: list[str]
+    dropped_breakers: list[str]
+    rescues: list[str]
+    skipped_rescues: list[str]
+    target_n_features: int
+    final_n_features: int
+
+
+def repair_rfe_separation(
+    X: pd.DataFrame,
+    y: pd.Series | np.ndarray,
+    rfe: RFE | None,
+    pre_rfe_feats: list[str] | None = None,
+    target_n_features: int | None = None,
+    max_rescue_trials: int = 50,
+) -> SeparationRepairResult:
+    """
+    Remove low-importance RFE features until separation is broken, then refill.
+
+    ``rfe`` may be ``None`` when the selector retained every input feature.
+    """
+    feature_names = np.asarray(pre_rfe_feats or X.columns.tolist())
+
+    if rfe is None:
+        selected = feature_names.tolist()
+        importance = pd.Series(0.0, index=selected)
+        ranked_candidates: list[str] = []
+        default_target = len(selected)
+    else:
+        selected = feature_names[rfe.support_].tolist()
+        importance = pd.Series(
+            np.abs(rfe.estimator_.coef_).ravel(),
+            index=selected,
+        )
+        ranked_candidates = [
+            feature
+            for feature, rank in sorted(
+                zip(feature_names, rfe.ranking_), key=lambda item: item[1]
+            )
+            if rank > 1
+        ]
+        default_target = int(rfe.n_features_)
+
+    target = default_target if target_n_features is None else target_n_features
+    dropped_breakers: list[str] = []
+
+    while selected and _check_complete_separation(X[selected], y).separable:
+        breaker = importance.loc[selected].idxmin()
+        selected.remove(breaker)
+        dropped_breakers.append(breaker)
+
+    rescues: list[str] = []
+    skipped_rescues: list[str] = []
+    rescue_order = list(reversed(dropped_breakers)) + ranked_candidates
+    for candidate in rescue_order[:max_rescue_trials]:
+        if len(selected) >= target:
+            break
+        if not _check_complete_separation(X[selected + [candidate]], y).separable:
+            selected.append(candidate)
+            rescues.append(candidate)
+        else:
+            skipped_rescues.append(candidate)
+
+    return {
+        "selected_features": selected,
+        "dropped_breakers": dropped_breakers,
+        "rescues": rescues,
+        "skipped_rescues": skipped_rescues,
+        "target_n_features": target,
+        "final_n_features": len(selected),
+    }
+
+
 def find_single_feature_separation_breakers(
     X: pd.DataFrame,
     y: pd.Series | np.ndarray,
 ) -> list[str]:
-    """
-    Identify features in a completely separable dataset whose removal breaks complete separation.
-    NO-op (returns an empty list) if the full feature matrix is not completely separable.
-
-    :param X: Feature matrix as a pandas DataFrame.
-    :param y: Response variable as a pandas Series or numpy array.
-    :return: List of feature names whose removal breaks complete separation.
-    """
-
-    baseline = _check_complete_separation(X, y)
-
-    # Nothing needs correcting if the full model is already nonseparable.
-    if not baseline.separable:
+    """Return features whose individual removal breaks complete separation."""
+    if not _check_complete_separation(X, y).separable:
         return []
 
-    breakers = []
-
-    for feature in X.columns:
-        reduced_result = _check_complete_separation(
-            X.drop(columns=[feature]),
-            y,
-        )
-
-        # This feature is a true breaker only because:
-        #   full X      = separable
-        #   X minus f   = nonseparable
-        if not reduced_result.separable:
-            breakers.append(feature)
-
-    return breakers
+    return [
+        feature
+        for feature in X.columns
+        if not _check_complete_separation(X.drop(columns=feature), y).separable
+    ]
 
 
 def _check_complete_separation(
@@ -60,43 +112,41 @@ def _check_complete_separation(
     y: pd.Series | np.ndarray,
 ) -> CompleteSeparationResult:
     """
-    Test for multivariate complete linear separation.
-
-    :param X: Feature matrix as a pandas DataFrame.
-    :param y: Response variable as a pandas Series or numpy array.
-    :return: CompleteSeparationResult indicating if complete separation exists.
-
-    Finds beta satisfying:
+    Test whether coefficients exist satisfying:
 
         y_i* (x_i @ beta) >= 1
 
-    for every observation, where y_i* is {-1, +1}.
+    for every observation, where y_i* is in {-1, +1}.
+    In other words, the dataset is completely separable if there exists a
+        hyperplane (linear decision boundary in n-D) that perfectly separates
+        the two classes.
     """
-    X = X.apply(pd.to_numeric, errors="raise")
-    X = sm.add_constant(X, has_constant="add")
+    design = sm.add_constant(
+        X.apply(pd.to_numeric, errors="raise"), has_constant="add"
+    )
+    y_values = np.asarray(y)
+    if set(np.unique(y_values)) != {0, 1}:
+        raise ValueError("y must contain both classes coded as 0 and 1.")
+    if len(y_values) != len(design):
+        raise ValueError("X and y must contain the same number of observations.")
 
-    y_arr = np.asarray(y)
-    if set(np.unique(y_arr)) - {0, 1}:
-        raise ValueError("y must be coded as 0/1.")
-
-    y_pm = np.where(y_arr == 1, 1.0, -1.0)
-    X_arr = X.to_numpy(dtype=float)
-
-    result = linprog(
-        c=np.zeros(X_arr.shape[1]),
-        A_ub=-(y_pm[:, None] * X_arr),
-        b_ub=-np.ones(len(y_pm)),
-        bounds=[(None, None)] * X_arr.shape[1],
-        method="highs",
+    signed_design = np.where(y_values == 1, 1.0, -1.0)[:, None] * design.to_numpy(
+        dtype=float
     )
 
-    coefs = None
-    if result.success:
-        coefs = pd.Series(result.x, index=X.columns)
+    result = linprog(
+        c=np.zeros(design.shape[1]),
+        A_ub=-signed_design,
+        b_ub=-np.ones(len(y_values)),
+        bounds=[(None, None)] * design.shape[1],
+        method="highs",
+    )
 
     return CompleteSeparationResult(
         separable=result.success,
         status=result.status,
         message=result.message,
-        coefficients=coefs,
+        coefficients=pd.Series(result.x, index=design.columns)
+        if result.success
+        else None,
     )
