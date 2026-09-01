@@ -1,4 +1,13 @@
-"""Detect and repair complete separation in binary feature matrices."""
+"""
+Detect and repair complete separation in binary feature matrices.
+
+Statistically does something remotely similar as the quasi-separation filter in `preprocess.py`.
+Both the quasi-separation filter and this module has the same aim of dropping
+    overly predictive features to stabilize ordinary least square convergence.
+    The quasi-separation filter is faster but weaker as it does not fit
+    full linear models. This module performs a slower but much more relevant
+    filtering on reduced feature sets and hence has better stabilizing effect.
+"""
 
 from dataclasses import dataclass
 from typing import TypedDict
