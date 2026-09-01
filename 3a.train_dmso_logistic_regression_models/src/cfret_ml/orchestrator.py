@@ -13,6 +13,7 @@ import pandas as pd
 from scipy.linalg import LinAlgError
 
 from .eval import evaluate_model, save_curve_plot
+from .eval_checkpoints import EvaluationCheckpoints, evaluation_fingerprint
 from .linear_sep import repair_rfe_separation
 from .preprocess import pre_fit_selection, screen_numeric_quasi_separation
 from .regression_feature_selector import fit_rfe_l1_logit_selector
@@ -105,18 +106,20 @@ def process_model_fitting(
     model_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_statsmodels_logit.joblib"
     model_failure_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_statsmodels_logit_fit_failed.txt"
     model_summary_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_smt_summary.txt"
-    eval_ckpt = plate_eval_plot_dir / f"fold_{fold}_{shuffle_status}_eval.json"
-    eval_plot_ckpt = plate_eval_plot_dir / f"fold_{fold}_{shuffle_status}_roc_pr.png"
+    eval_checkpoints = EvaluationCheckpoints.for_fold(
+        plate_eval_plot_dir,
+        fold,
+        shuffle_status,
+    )
 
     if force_overwrite_post_rfe:
         for checkpoint in (
             model_ckpt,
             model_failure_ckpt,
             model_summary_ckpt,
-            eval_ckpt,
-            eval_plot_ckpt,
         ):
             checkpoint.unlink(missing_ok=True)
+        eval_checkpoints.clear()
         print(f"{log_prefix} Cleared existing post-RFE outputs.")
 
     if filter_linear_separation:
@@ -189,12 +192,20 @@ def process_model_fitting(
             return empty_result
 
     # Evaluate model on test set
-    if eval_plot_ckpt.exists():
-        metric_row = json.loads(eval_ckpt.read_text())
-    else:
+    test_profiles_selected = test_profiles.loc[:, selected_features]
+    eval_fingerprint = evaluation_fingerprint(
+        smt_result,
+        test_profiles_selected,
+        test_labels,
+    )
+    metric_row = eval_checkpoints.load_if_valid(eval_fingerprint)
+
+    if metric_row is None:
+        eval_checkpoints.clear()
+
         y_score, ap, roc_auc = evaluate_model(
             smt_result,
-            test_profiles.loc[:, selected_features],
+            test_profiles_selected,
             test_labels,
         )
 
@@ -209,15 +220,16 @@ def process_model_fitting(
             "average_precision": ap,
             "roc_auc": roc_auc,
         }
-        with open(eval_ckpt, "w") as f:
+        with open(eval_checkpoints.metrics, "w") as f:
             json.dump(metric_row, f, indent=4)
 
         save_curve_plot(
             test_labels.to_numpy(),
             y_score,
-            eval_plot_ckpt,
+            eval_checkpoints.plot,
             title_prefix=f"{plate_repr} fold {fold} {shuffle_status}",
         )
+        eval_checkpoints.mark_complete(eval_fingerprint)
 
     return metric_row
 
