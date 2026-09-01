@@ -107,7 +107,7 @@ control_cell_counts.to_csv(datasplit_dir / 'control_cell_counts.csv', index=Fals
 control_cell_counts.head(10)
 
 
-# In[5]:
+# In[ ]:
 
 
 # Set the output directory
@@ -134,8 +134,10 @@ else:
     salted_seed = salt_seed(random_state, plate_name_salt)
 
     # Check to confirm two classes are present
-    if DMSO_df["Metadata_cell_type"].nunique() < 2:
-        raise ValueError(f"Only one cell type present in {plate_repr}. Cannot perform stratified split.")
+    if DMSO_df["Metadata_cell_type"].nunique() != 2:
+        raise ValueError(
+            f"Expected exactly two cell types in {plate_repr}. Cannot perform binary classification."
+        )
 
     # Perform stratified fold split (grouped by well, stratified by cell type)
     split = stratified_fold_split(
@@ -202,7 +204,7 @@ eval_plot_dir.mkdir(exist_ok=True)
 
 # ## Train logit model
 
-# In[7]:
+# In[ ]:
 
 
 # Load cell type encoding used during data splitting
@@ -328,7 +330,38 @@ for fold_idx, (train_idx, test_idx) in enumerate(zip(train_splits, test_splits))
 print(f"Executing {len(tasks)} model fitting tasks in parallel (n_jobs=8)...")
 results = Parallel(n_jobs=8)(delayed(process_model_fitting)(**kwargs) for kwargs in tasks)
 
-results_df = pd.DataFrame(results)
+# process_model_fitting returns None when a fold is skipped before any model is
+# fit (e.g. no features survive filtering/RFE). Normalize every task result --
+# None included -- into a row that carries the merge keys (plate, fold,
+# shuffled) plus an explicit fit_status, so skipped folds still produce a row
+# instead of an all-NaN merge key that would silently drop out of the
+# downstream merge, summary CSV, and convergence plots.
+normalized_results = []
+for task, result in zip(tasks, results):
+    if result is None:
+        normalized_results.append({
+            "plate": task["plate_repr"],
+            "fold": task["fold"],
+            "shuffled": task["shuffle_status"] == "shuffled",
+            "fit_status": "skipped",
+        })
+    else:
+        metrics_missing = pd.isna(result.get("average_precision")) or pd.isna(result.get("roc_auc"))
+        normalized_results.append({
+            **result,
+            "fit_status": "failed" if metrics_missing else "success",
+        })
+
+# Pin the expected columns explicitly (rather than letting pandas infer them
+# from the row dicts) so results_df always has the merge keys and the metric
+# columns the convergence plot reads, even if every task was skipped/failed
+# and no row actually carries average_precision/roc_auc.
+result_columns = [
+    "plate", "fold", "shuffled", "n_train", "n_test",
+    "n_input_features", "n_selected_features",
+    "average_precision", "roc_auc", "fit_status",
+]
+results_df = pd.DataFrame(normalized_results, columns=result_columns)
 split_df = pd.DataFrame(split_rows)
 enriched_df = pd.merge(
     results_df,
