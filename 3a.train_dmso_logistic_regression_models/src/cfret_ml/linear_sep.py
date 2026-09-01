@@ -45,7 +45,15 @@ def repair_rfe_separation(
     max_rescue_trials: int = 50,
 ) -> SeparationRepairResult:
     """
-    Remove low-importance RFE features until separation is broken, then refill.
+    Remove low-importance RFE features until linear separation is broken, then refill.
+    - Please see `_check_complete_separation` for more details on definition of linear separation.
+    
+    Having a linearly separable dataset makes the fitting of ordinary least square
+        very unstable as the coefficients will arbitrarily swell towards infinity.
+    This helper finds problematic features and applies minimal reduction to break separability.
+    It also attempts to "refill" the feature set by adding back the lower ranking features
+        ranked by recursive feature elimination so the maximal amount of features
+        is preserved for modelling. 
 
     ``rfe`` may be ``None`` when the selector retained every input feature.
     """
@@ -128,7 +136,7 @@ def _check_complete_separation(
     for every observation, where y_i* is in {-1, +1}.
     In other words, the dataset is completely separable if there exists a
         hyperplane (linear decision boundary in n-D) that perfectly separates
-        the two classes.
+        the two classes. 
     """
     design = sm.add_constant(
         X.apply(pd.to_numeric, errors="raise"), has_constant="add"
