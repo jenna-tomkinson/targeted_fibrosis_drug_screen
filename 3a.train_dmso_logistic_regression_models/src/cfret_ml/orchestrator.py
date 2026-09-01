@@ -42,7 +42,8 @@ def process_model_fitting(
     Set ``force_overwrite_post_rfe`` to preserve preprocessing and RFE
         checkpoints while regenerating all final model and evaluation outputs.
     """
-    # filter for low variance, covariance, and quasi-separation issues
+
+    ## Step 1) filter for low variance, covariance, and quasi-separation issues
     feat_filter_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_feat.tsv"
     log_prefix = f"\tPlate {plate_repr} Fold {fold} {shuffle_status} >"
     if feat_filter_ckpt.exists():
@@ -77,7 +78,16 @@ def process_model_fitting(
 
     train_profiles_filtered = train_profiles.loc[:, cols2keep]
 
-    # rfe feature selection prior to final model fitting
+
+    ## Step 2) RFE (recursive feature elimination) feature selection
+
+    # This step reduces the feature size to a number proportional to the 
+    # number of the minority binary classes (one-in-ten vs one-in-twenty rule),
+    # which is crucial for subsequent ordinary least square model fitting.
+    # (if too many features are used to model too little sample size, the model
+    # struggles to find a unique solution and usually will lose statistical
+    # inference power). 
+
     rfe_selected_feat_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_rfe_selected_features.tsv"
     rfe_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_rfe.joblib"
     if rfe_selected_feat_ckpt.exists():
@@ -103,6 +113,12 @@ def process_model_fitting(
         print(f"{log_prefix} No features selected by RFE, skipping model fitting.")
         return None
 
+    ## 2.5) force re-run after RFE
+
+    # Because the RFE is such a time consuming step, and more robust + compared to ordinary least squares, 
+    # having the ability to partially re-run the faster steps following RFE is desirable. 
+    # Here all subsequent checkpoints are wiped if forced to re-run.
+    
     model_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_statsmodels_logit.joblib"
     model_failure_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_statsmodels_logit_fit_failed.txt"
     model_summary_ckpt = plate_fitted_model_dir / f"fold_{fold}_{shuffle_status}_smt_summary.txt"
@@ -122,7 +138,17 @@ def process_model_fitting(
         eval_checkpoints.clear()
         print(f"{log_prefix} Cleared existing post-RFE outputs.")
 
+    ##  3) Final linear separation repair & fit final logit model
+
+    # The filter linear separation is almost necessary given how
+    # highly correlated certain image feature combinations can be vs. outcome.
+
     if filter_linear_separation:
+        # This step repairs linear separation issues on the RFE
+        # reduced feature set, drops the least predictive feature that
+        # causes linear separation, and attempts to re-fill
+        # the feature set with "wait-listed" (previously eliminated) features.
+
         repair = repair_rfe_separation(
             train_profiles_filtered,
             labels,
@@ -169,6 +195,10 @@ def process_model_fitting(
         print(f"\tPrevious attempt to fit statsmodels Logit for plate {plate_repr} fold {fold} {shuffle_status} failed to converge, skipping.")
         return empty_result
 
+    # Fit final logit model using the repaired feautres if enabled. 
+    # This can fail in many varied ways, the most common path of failure
+    # due to perfect linear separation is addressed by the separation repair.
+
     if smt_result is None:
         try:
             smt_result, _ = fit_statsmodels_logit(
@@ -191,7 +221,13 @@ def process_model_fitting(
                 f.write(f"Statsmodels Logit fit failed due to Error {e}.")
             return empty_result
 
-    # Evaluate model on test set
+    ## 4) Evaluate model on test set
+
+    # Because the eval step has the least amount of clues on what has happened
+    # and changed in previous step. It has a dedicated finger printing step
+    # to validate whether its checkpointed results are outdated relative to the
+    # full profile set and features. 
+
     test_profiles_selected = test_profiles.loc[:, selected_features]
     eval_fingerprint = evaluation_fingerprint(
         smt_result,
