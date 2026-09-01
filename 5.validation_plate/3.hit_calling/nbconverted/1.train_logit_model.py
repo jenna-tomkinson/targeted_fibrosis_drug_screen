@@ -341,7 +341,7 @@ enriched_df.to_csv(eval_plot_dir / "model_fit_summary.csv", index=False)
 
 # ## Visualize model performance across folds
 
-# In[9]:
+# In[8]:
 
 
 enriched_df['convergence_failed'] = (
