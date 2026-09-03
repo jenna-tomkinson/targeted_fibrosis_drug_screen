@@ -3,7 +3,7 @@
 
 # # mAP Analysis bulk profiles
 # 
-# > Note: This notebook and code are updated from Weishan Li.
+# > Note: This notebook and code are updated from Erik Serrano.
 # 
 # This notebook computes mean Average Precision (mAP) scores for every compound treatment in the validation plate using bulk morphological profiles.
 # 
