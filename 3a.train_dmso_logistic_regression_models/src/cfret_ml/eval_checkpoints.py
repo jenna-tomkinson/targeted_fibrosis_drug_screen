@@ -19,8 +19,12 @@ import pandas as pd
 class EvaluationCheckpoints:
     """
     Checkpoints for logit model evaluation.
-    Enables evaluation outputs to be fingerprinted against the model checkpoint,
-    ensuring state consistency between model and evaluation data.
+    Needed because previous evaluation outputs have no clear indication of what 
+        specific model and data it was generated from. As the current implementation
+        allows for re-running of the model fitting process with altered parameters,
+        the evaluation outputs can become stale and inconsistent with the model checkpoint.
+    This class enables evaluation outputs to be fingerprinted against the model checkpoint
+        and data ensuring state consistency. 
     """
     metrics: pathlib.Path
     plot: pathlib.Path
