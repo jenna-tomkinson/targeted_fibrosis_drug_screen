@@ -160,11 +160,11 @@ def process_model_fitting(
         )
         selected_features = repair["selected_features"]
         print(
-            f"{log_prefix} Separation repair retained "
-            f"{repair['final_n_features']} of "
-            f"{repair['target_n_features']} target features after dropping "
-            f"{len(repair['dropped_breakers'])} "
-            f"and rescuing {len(repair['rescues'])} features."
+            f"{log_prefix} Separation repair summary:\n"
+            f"\t  Target features: {repair['target_n_features']}\n"
+            f"\t  Final features: {repair['final_n_features']}\n"
+            f"\t  Dropped breakers: {len(repair['dropped_breakers'])}\n"
+            f"\t  Rescued features: {len(repair['rescues'])}"
         )
 
     train_profiles_rfe = train_profiles_filtered.loc[:, selected_features]
