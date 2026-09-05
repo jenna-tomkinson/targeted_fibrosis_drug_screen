@@ -17,6 +17,11 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class EvaluationCheckpoints:
+    """
+    Checkpoints for logit model evaluation.
+    Enables evaluation outputs to be fingerprinted against the model checkpoint,
+    ensuring state consistency between model and evaluation data.
+    """
     metrics: pathlib.Path
     plot: pathlib.Path
     fingerprint: pathlib.Path
@@ -28,6 +33,9 @@ class EvaluationCheckpoints:
         fold: int | str,
         shuffle_status: str,
     ) -> "EvaluationCheckpoints":
+        """
+        Create a new EvaluationCheckpoints instance for a given fold and shuffle status.
+        """
         prefix = output_dir / f"fold_{fold}_{shuffle_status}"
         return cls(
             metrics=prefix.with_name(f"{prefix.name}_eval.json"),
@@ -36,10 +44,15 @@ class EvaluationCheckpoints:
         )
 
     def clear(self) -> None:
+        """
+        Helper for clearing all evaluation checkpoints. 
+        This is useful for clean up when re-running evaluations (upon stale).
+        """
         for checkpoint in (self.metrics, self.plot, self.fingerprint):
             checkpoint.unlink(missing_ok=True)
 
     def load_if_valid(self, expected_fingerprint: str) -> dict[str, object] | None:
+        """Load the evaluation metrics if the fingerprint matches the expected value.        """
         if not all(
             checkpoint.exists()
             for checkpoint in (self.metrics, self.plot, self.fingerprint)
@@ -64,7 +77,15 @@ def evaluation_fingerprint(
     test_profiles: pd.DataFrame,
     test_labels: pd.Series | np.ndarray,
 ) -> str:
-    """Identify the fitted model and ordered data used for evaluation."""
+    """
+    Identify the fitted model and ordered data used for evaluation.
+    Namely, the fingerprint is a SHA256 hash of the model parameters, test profiles, and test labels.
+
+    :param fitted_model: The fitted model object (e.g., a statsmodels LogitResults instance).
+    :param test_profiles: The test profiles DataFrame used for evaluation.
+    :param test_labels: The test labels (as a Series or ndarray) used for evaluation.
+    :return: A SHA256 fingerprint string representing the evaluation state.
+    """
     metadata = {
         "schema": "cfret-evaluation-v1",
         "model_columns": list(fitted_model.model.exog_names),
