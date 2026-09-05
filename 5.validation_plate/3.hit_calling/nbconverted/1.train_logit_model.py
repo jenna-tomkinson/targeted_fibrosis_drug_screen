@@ -10,7 +10,7 @@
 
 # ## Import libraries
 
-# In[1]:
+# In[ ]:
 
 
 import json
@@ -33,6 +33,7 @@ from cfret_ml.data_split_utils import (
     string_to_int_seed,
 )
 from cfret_ml.data_utils import split_and_prep_data
+from cfret_ml.fit_summary import write_model_fit_summary
 from cfret_ml.orchestrator import process_model_fitting
 
 
@@ -224,7 +225,7 @@ plate_dir = plate_level_splits[0]
 plate_repr = plate_dir.name
 
 # Load split files
-split_json_files = list(plate_dir.glob("fold_*_split.json"))
+split_json_files = sorted(plate_dir.glob("fold_*_split.json"))
 if not split_json_files:
     raise FileNotFoundError(f"No fold split files found in {plate_dir}.")
 dmso_parquet = plate_dir / "DMSO.parquet"
@@ -248,9 +249,9 @@ train_splits = [None] * len(split_json_files)
 test_splits = [None] * len(split_json_files)
 
 tasks = []
-split_rows = []
+split_records = []
 
-# Process each split JSON file to extract train/test indices and summary statistics
+# Load each fold's indices and retain its structured metadata for reporting
 for split_json in split_json_files:
 
     with open(split_json, "r") as f:
@@ -258,19 +259,7 @@ for split_json in split_json_files:
 
     train_splits[split_info['fold']] = split_info["train_index"]
     test_splits[split_info['fold']] = split_info["test_index"]
-
-    split_row = {
-        "plate": plate_repr,
-        "fold": split_info["fold"],
-        "train_n": len(split_info["train_index"]),
-        "test_n": len(split_info["test_index"]),
-        **{
-            f"{split}_{label}": split_info[split][label]
-            for split in ["train", "test"]
-            for label in split_info[split]
-        }
-    }
-    split_rows.append(split_row)
+    split_records.append(split_info)
 
 # Iterate through the splits in order of fold index to create model fitting tasks
 for fold_idx, (train_idx, test_idx) in enumerate(zip(train_splits, test_splits)):
@@ -326,50 +315,21 @@ for fold_idx, (train_idx, test_idx) in enumerate(zip(train_splits, test_splits))
             "random_state": random_state
         })
 
-# Run all the model fitting tasks in parallel and collect results into a dataframe, then merge with the split summary statistics and save to CSV
+# Run all the model fitting tasks in parallel
 print(f"Executing {len(tasks)} model fitting tasks in parallel (n_jobs=8)...")
 results = Parallel(n_jobs=8)(delayed(process_model_fitting)(**kwargs) for kwargs in tasks)
 
-# process_model_fitting returns None when a fold is skipped before any model is
-# fit (e.g. no features survive filtering/RFE). Normalize every task result --
-# None included -- into a row that carries the merge keys (plate, fold,
-# shuffled) plus an explicit fit_status, so skipped folds still produce a row
-# instead of an all-NaN merge key that would silently drop out of the
-# downstream merge, summary CSV, and convergence plots.
-normalized_results = []
-for task, result in zip(tasks, results):
-    if result is None:
-        normalized_results.append({
-            "plate": task["plate_repr"],
-            "fold": task["fold"],
-            "shuffled": task["shuffle_status"] == "shuffled",
-            "fit_status": "skipped",
-        })
-    else:
-        metrics_missing = pd.isna(result.get("average_precision")) or pd.isna(result.get("roc_auc"))
-        normalized_results.append({
-            **result,
-            "fit_status": "failed" if metrics_missing else "success",
-        })
-
-# Pin the expected columns explicitly (rather than letting pandas infer them
-# from the row dicts) so results_df always has the merge keys and the metric
-# columns the convergence plot reads, even if every task was skipped/failed
-# and no row actually carries average_precision/roc_auc.
-result_columns = [
-    "plate", "fold", "shuffled", "n_train", "n_test",
-    "n_input_features", "n_selected_features",
-    "average_precision", "roc_auc", "fit_status",
-]
-results_df = pd.DataFrame(normalized_results, columns=result_columns)
-split_df = pd.DataFrame(split_rows)
-enriched_df = pd.merge(
-    results_df,
-    split_df,
-    on=["plate", "fold"],
-    how="left",
+# Keep model metrics and datasplit assignments in separate normalized tables.
+# model_fit_summary.csv has one scalar-only row per fit, while
+# model_fit_datasplit_assignments.csv has one row per assigned well. Both use
+# plate and fold as join keys; no Python lists are serialized into CSV cells.
+enriched_df, split_assignments_df = write_model_fit_summary(
+    plate_repr,
+    tasks,
+    results,
+    split_records,
+    eval_plot_dir,
 )
-enriched_df.to_csv(eval_plot_dir / "model_fit_summary.csv", index=False)
 
 
 # ## Visualize model performance across folds
